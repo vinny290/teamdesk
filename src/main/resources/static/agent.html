@@ -3,16 +3,56 @@
 <head>
     <meta charset="UTF-8">
     <title>Agent</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        .controls {
+            margin-bottom: 16px;
+        }
+
+        #log {
+            background: #111;
+            color: #0f0;
+            padding: 12px;
+            height: 320px;
+            overflow: auto;
+            white-space: pre-wrap;
+        }
+    </style>
 </head>
 <body>
 <h1>Agent</h1>
-<label>Machine ID: <input id="machineId" value="machine-1"></label>
-<button id="registerBtn">Register & Share screen</button>
 
-<pre id="log" style="background:#111;color:#0f0;padding:12px;height:300px;overflow:auto;"></pre>
+<div class="controls">
+    <label>
+        Machine ID:
+        <input id="machineId" value="machine-1">
+    </label>
+
+    <br><br>
+
+    <button id="startBtn">Start sharing</button>
+    <button id="stopBtn">Stop sharing</button>
+</div>
+
+<pre id="log"></pre>
 
 <script>
     const logEl = document.getElementById("log");
+
+    let ws = null;
+    let pc = null;
+    let dataChannel = null;
+    let localStream = null;
+    let heartbeatInterval = null;
+    let isRegistered = false;
+    let isStarting = false;
+    let currentMachineId = null;
+    let currentViewerId = null;
+    let currentSessionId = null;
 
     function log(...args) {
         console.log(...args);
@@ -20,88 +60,145 @@
         logEl.scrollTop = logEl.scrollHeight;
     }
 
-    const ws = new WebSocket("ws://localhost:8080/ws/signaling");
-    let pc = null;
-    let dataChannel = null;
-    let localStream = null;
+    function getMachineId() {
+        return document.getElementById("machineId").value.trim();
+    }
 
-    ws.onopen = () => {
-        log("WS opened");
-    };
+    function isWsOpen() {
+        return ws && ws.readyState === WebSocket.OPEN;
+    }
 
-    ws.onerror = (e) => {
-        log("WS error", e);
-    };
-
-    ws.onclose = (e) => {
-        log("WS close", e.code, e.reason);
-    };
-
-    ws.onmessage = async (event) => {
-        const msg = JSON.parse(event.data);
-        log("WS message:", msg);
-
-        try {
-            if (msg.type === "SDP_OFFER") {
-                log("Received SDP_OFFER");
-
-                await ensurePeer(msg.viewerId, msg.sessionId, msg.machineId);
-
-                await pc.setRemoteDescription({
-                    type: "offer",
-                    sdp: msg.sdp
-                });
-                log("Remote description set");
-
-                const answer = await pc.createAnswer();
-                log("Answer created");
-
-                await pc.setLocalDescription(answer);
-                log("Local description set");
-
-                ws.send(JSON.stringify({
-                    type: "SDP_ANSWER",
-                    sessionId: msg.sessionId,
-                    machineId: msg.machineId,
-                    viewerId: msg.viewerId,
-                    sdp: answer.sdp
-                }));
-                log("SDP_ANSWER sent");
-
-                ws.send(JSON.stringify({
-                    type: "START_SESSION_ACK",
-                    sessionId: msg.sessionId,
-                    machineId: msg.machineId,
-                    viewerId: msg.viewerId
-                }));
-                log("START_SESSION_ACK sent");
-            }
-
-            if (msg.type === "ICE_CANDIDATE") {
-                log("Received ICE_CANDIDATE");
-                if (pc) {
-                    await pc.addIceCandidate({
-                        candidate: msg.candidate,
-                        sdpMid: msg.sdpMid,
-                        sdpMLineIndex: msg.sdpMLineIndex
-                    });
-                }
-            }
-        } catch (err) {
-            log("WS message handling error:", err.message);
-            console.error(err);
+    function safeSend(payload) {
+        if (!isWsOpen()) {
+            log("WS не открыт, сообщение не отправлено:", payload.type);
+            return false;
         }
-    };
 
-    async function ensurePeer(viewerId, sessionId, machineId) {
-        if (pc) return;
+        ws.send(JSON.stringify(payload));
+        return true;
+    }
 
-        log("Requesting display media");
+    function createWebSocket() {
+        return new Promise((resolve, reject) => {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                resolve(ws);
+                return;
+            }
+
+            ws = new WebSocket("ws://localhost:8080/ws/signaling");
+
+            ws.onopen = () => {
+                log("WS connected");
+                resolve(ws);
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                log("WS message:", msg);
+
+                try {
+                    if (msg.type === "SDP_OFFER") {
+                        log("Received SDP_OFFER");
+
+                        currentViewerId = msg.viewerId;
+                        currentSessionId = msg.sessionId;
+
+                        await ensurePeer(msg.viewerId, msg.sessionId, msg.machineId);
+
+                        await pc.setRemoteDescription({
+                            type: "offer",
+                            sdp: msg.sdp
+                        });
+                        log("Remote description set");
+
+                        const answer = await pc.createAnswer();
+                        await pc.setLocalDescription(answer);
+                        log("Local description set");
+
+                        safeSend({
+                            type: "SDP_ANSWER",
+                            sessionId: msg.sessionId,
+                            machineId: msg.machineId,
+                            viewerId: msg.viewerId,
+                            sdp: answer.sdp
+                        });
+                        log("SDP_ANSWER sent");
+
+                        safeSend({
+                            type: "START_SESSION_ACK",
+                            sessionId: msg.sessionId,
+                            machineId: msg.machineId,
+                            viewerId: msg.viewerId
+                        });
+                        log("START_SESSION_ACK sent");
+                    }
+
+                    if (msg.type === "ICE_CANDIDATE") {
+                        if (!pc) {
+                            log("ICE received, but pc is null");
+                            return;
+                        }
+
+                        await pc.addIceCandidate({
+                            candidate: msg.candidate,
+                            sdpMid: msg.sdpMid,
+                            sdpMLineIndex: msg.sdpMLineIndex
+                        });
+                        log("ICE candidate added");
+                    }
+
+                    if (msg.type === "INPUT_EVENT") {
+                        const payload = JSON.parse(msg.payload);
+                        log("INPUT:", payload);
+                    }
+                } catch (e) {
+                    log("WS message handling error:", e.message);
+                    console.error(e);
+                }
+            };
+
+            ws.onerror = (e) => {
+                log("WS error", e);
+            };
+
+            ws.onclose = (e) => {
+                log("WS closed", e.code, e.reason);
+            };
+        });
+    }
+
+    async function ensureScreenCaptureStarted() {
+        if (localStream) {
+            return;
+        }
+
+        log("Запрашиваю разрешение на захват экрана...");
+
         localStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
+            video: {
+                cursor: "always"
+            },
             audio: false
         });
-        log("Display media granted");
+
+        log("Захват экрана разрешён");
+
+        localStream.getVideoTracks().forEach(track => {
+            track.onended = async () => {
+                log("Пользователь остановил шаринг экрана через браузер");
+                await stopSharing(false);
+            };
+        });
+    }
+
+    async function ensurePeer(viewerId, sessionId, machineId) {
+        if (pc) {
+            return;
+        }
+
+        if (!localStream) {
+            await ensureScreenCaptureStarted();
+        }
 
         pc = new RTCPeerConnection({
             iceServers: [
@@ -122,8 +219,8 @@
         };
 
         localStream.getTracks().forEach(track => {
-            log("Adding track:", track.kind);
             pc.addTrack(track, localStream);
+            log("Track added:", track.kind);
         });
 
         pc.onicecandidate = (event) => {
@@ -132,9 +229,7 @@
                 return;
             }
 
-            log("Sending ICE candidate");
-
-            ws.send(JSON.stringify({
+            safeSend({
                 type: "ICE_CANDIDATE",
                 sessionId,
                 machineId,
@@ -142,57 +237,189 @@
                 candidate: event.candidate.candidate,
                 sdpMid: event.candidate.sdpMid,
                 sdpMLineIndex: event.candidate.sdpMLineIndex
-            }));
+            });
+            log("ICE_CANDIDATE sent");
         };
 
         pc.ondatachannel = (event) => {
-            log("DataChannel received");
             dataChannel = event.channel;
+            log("DataChannel received");
 
             dataChannel.onopen = () => log("DataChannel open");
             dataChannel.onclose = () => log("DataChannel close");
             dataChannel.onerror = (e) => log("DataChannel error", e);
-
-            dataChannel.onmessage = (ev) => {
-                log("control event:", ev.data);
-            };
+            dataChannel.onmessage = (ev) => log("DataChannel message:", ev.data);
         };
     }
 
-    document.getElementById("registerBtn").onclick = async () => {
-        const machineId = document.getElementById("machineId").value;
-
-        log("Registering machine:", machineId);
-
-        const res = await fetch("/api/machines/register", {
+    async function registerMachine(machineId) {
+        const response = await fetch("/api/machines/register", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json"
+            },
             body: JSON.stringify({
                 machineId,
-                hostname: "demo-browser-agent",
+                hostname: "browser-agent",
                 osName: navigator.platform,
-                agentVersion: "0.1-demo",
+                agentVersion: "0.1",
                 ip: "browser"
             })
         });
 
-        log("Register response:", res.status);
+        if (!response.ok) {
+            throw new Error("Не удалось зарегистрировать машину: " + response.status);
+        }
 
-        ws.send(JSON.stringify({
-            type: "REGISTER_AGENT",
-            machineId
-        }));
+        log("Machine registered in REST:", machineId);
+    }
 
-        log("REGISTER_AGENT sent");
+    function startHeartbeat(machineId) {
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+        }
 
-        setInterval(() => {
-            ws.send(JSON.stringify({
+        heartbeatInterval = setInterval(() => {
+            safeSend({
                 type: "HEARTBEAT",
                 machineId
-            }));
-            log("HEARTBEAT sent");
+            });
         }, 5000);
+
+        log("Heartbeat started");
+    }
+
+    async function startSharing() {
+        if (isStarting) {
+            log("Запуск уже выполняется");
+            return;
+        }
+
+        isStarting = true;
+
+        try {
+            const machineId = getMachineId();
+            if (!machineId) {
+                throw new Error("Machine ID обязателен");
+            }
+
+            currentMachineId = machineId;
+
+            await createWebSocket();
+            await ensureScreenCaptureStarted();
+            await registerMachine(machineId);
+
+            const sent = safeSend({
+                type: "REGISTER_AGENT",
+                machineId
+            });
+
+            if (!sent) {
+                throw new Error("Не удалось отправить REGISTER_AGENT");
+            }
+
+            isRegistered = true;
+            startHeartbeat(machineId);
+
+            log("Sharing started");
+        } catch (e) {
+            log("Start sharing error:", e.message);
+            console.error(e);
+        } finally {
+            isStarting = false;
+        }
+    }
+
+    async function stopSharing(sendOfflineRequest = true) {
+        const machineId = currentMachineId || getMachineId();
+
+        log("Stopping sharing:", machineId);
+
+        try {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+
+            if (dataChannel) {
+                try {
+                    dataChannel.close();
+                } catch (e) {
+                    console.error(e);
+                }
+                dataChannel = null;
+            }
+
+            if (pc) {
+                try {
+                    pc.close();
+                } catch (e) {
+                    console.error(e);
+                }
+                pc = null;
+            }
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+
+            if (isRegistered) {
+                safeSend({
+                    type: "UNREGISTER_AGENT",
+                    machineId
+                });
+                isRegistered = false;
+            }
+
+            if (sendOfflineRequest) {
+                try {
+                    await fetch(`/api/machines/${machineId}/offline`, {
+                        method: "PATCH"
+                    });
+                } catch (e) {
+                    log("PATCH offline failed:", e.message);
+                }
+            }
+
+            currentViewerId = null;
+            currentSessionId = null;
+
+            log("Sharing stopped");
+        } catch (e) {
+            log("Stop sharing error:", e.message);
+            console.error(e);
+        }
+    }
+
+    document.getElementById("startBtn").onclick = async () => {
+        await startSharing();
     };
+
+    document.getElementById("stopBtn").onclick = async () => {
+        await stopSharing(true);
+    };
+
+    window.addEventListener("beforeunload", () => {
+        try {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+            }
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+
+            if (isWsOpen()) {
+                ws.send(JSON.stringify({
+                    type: "UNREGISTER_AGENT",
+                    machineId: currentMachineId || getMachineId()
+                }));
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    });
 </script>
 </body>
 </html>

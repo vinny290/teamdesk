@@ -33,4 +33,16 @@ public class MachineController {
     public ResponseEntity<List<MachineDto>> list() {
         return ResponseEntity.ok(machineService.findAll());
     }
+
+    @PatchMapping("/{machineId}/offline")
+    public ResponseEntity<Void> markOffline(@PathVariable String machineId) {
+        machineService.deactivate(machineId);
+        return ResponseEntity.ok().build();
+    }
+
+    @DeleteMapping("/{machineId}")
+    public ResponseEntity<Void> delete(@PathVariable String machineId) {
+        machineService.delete(machineId);
+        return ResponseEntity.noContent().build();
+    }
 }

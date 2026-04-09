@@ -3,84 +3,351 @@
 <head>
     <meta charset="UTF-8">
     <title>Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        .controls {
+            margin-bottom: 16px;
+        }
+
+        #remoteVideo {
+            width: 1000px;
+            max-width: 100%;
+            border: 1px solid #999;
+            background: #000;
+            display: block;
+            cursor: none;
+            outline: none;
+        }
+
+        #log {
+            background: #111;
+            color: #0f0;
+            padding: 12px;
+            height: 260px;
+            overflow: auto;
+            white-space: pre-wrap;
+            margin-top: 16px;
+        }
+    </style>
 </head>
 <body>
 <h1>Viewer</h1>
 
-<label>Viewer ID: <input id="viewerId" value="viewer-1"></label><br>
-<label>Machine ID: <input id="machineId" value="machine-1"></label><br>
-<button id="startBtn">Start session</button>
+<div class="controls">
+    <label>
+        Viewer ID:
+        <input id="viewerId" value="viewer-1">
+    </label>
 
-<video id="remoteVideo" autoplay playsinline controls style="width: 900px; border: 1px solid #999;"></video>
+    <br><br>
 
-<pre id="log" style="background:#111;color:#0f0;padding:12px;height:300px;overflow:auto;"></pre>
+    <label>
+        Machine ID:
+        <input id="machineId" value="machine-1">
+    </label>
+
+    <br><br>
+
+    <button id="connectBtn">Connect signaling</button>
+    <button id="startBtn">Start session</button>
+    <button id="stopBtn">Stop session</button>
+</div>
+
+<video
+        id="remoteVideo"
+        autoplay
+        playsinline
+        muted
+        tabindex="1"
+></video>
+
+<pre id="log"></pre>
 
 <script>
     const logEl = document.getElementById("log");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    let ws = null;
+    let pc = null;
+    let dataChannel = null;
+    let currentSessionId = null;
+    let controlsAttached = false;
+    let signalingConnected = false;
 
     function log(...args) {
         console.log(...args);
-        logEl.textContent += args.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ") + "\n";
+        logEl.textContent += args
+            .map(x => typeof x === "string" ? x : JSON.stringify(x))
+            .join(" ") + "\n";
         logEl.scrollTop = logEl.scrollHeight;
     }
 
-    const ws = new WebSocket("ws://localhost:8080/ws/signaling");
-    let pc = null;
-    let dc = null;
-    let currentSessionId = null;
+    function getViewerId() {
+        return document.getElementById("viewerId").value.trim();
+    }
 
-    ws.onopen = () => {
-        const viewerId = document.getElementById("viewerId").value;
-        log("WS opened, register viewer:", viewerId);
+    function getMachineId() {
+        return document.getElementById("machineId").value.trim();
+    }
+
+    function connectSignaling() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            log("Signaling уже подключён или в процессе подключения");
+            return;
+        }
+
+        ws = new WebSocket("ws://localhost:8080/ws/signaling");
+
+        ws.onopen = () => {
+            signalingConnected = true;
+            log("WS connected");
+
+            const viewerId = getViewerId();
+
+            ws.send(JSON.stringify({
+                type: "REGISTER_VIEWER",
+                viewerId
+            }));
+
+            log("REGISTER_VIEWER sent:", viewerId);
+        };
+
+        ws.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            log("WS message:", msg);
+
+            try {
+                if (msg.type === "START_SESSION_ACK") {
+                    currentSessionId = msg.sessionId;
+                    log("Session ACK received:", currentSessionId);
+                }
+
+                if (msg.type === "SDP_ANSWER") {
+                    if (!pc) {
+                        log("SDP_ANSWER received, but pc is null");
+                        return;
+                    }
+
+                    await pc.setRemoteDescription({
+                        type: "answer",
+                        sdp: msg.sdp
+                    });
+
+                    log("Remote description set");
+                }
+
+                if (msg.type === "ICE_CANDIDATE") {
+                    if (!pc) {
+                        log("ICE_CANDIDATE received, but pc is null");
+                        return;
+                    }
+
+                    await pc.addIceCandidate({
+                        candidate: msg.candidate,
+                        sdpMid: msg.sdpMid,
+                        sdpMLineIndex: msg.sdpMLineIndex
+                    });
+
+                    log("ICE candidate added");
+                }
+            } catch (e) {
+                log("WS message handling error:", e.message);
+                console.error(e);
+            }
+        };
+
+        ws.onerror = (e) => {
+            log("WS error", e);
+        };
+
+        ws.onclose = (e) => {
+            signalingConnected = false;
+            log("WS closed", e.code, e.reason);
+        };
+    }
+
+    function mapMouseButton(button) {
+        switch (button) {
+            case 0: return 1; // left
+            case 1: return 2; // middle
+            case 2: return 3; // right
+            default: return 1;
+        }
+    }
+
+    function getNormalizedCoordinates(video, event) {
+        const rect = video.getBoundingClientRect();
+
+        let x = (event.clientX - rect.left) / rect.width;
+        let y = (event.clientY - rect.top) / rect.height;
+
+        x = Math.max(0, Math.min(1, x));
+        y = Math.max(0, Math.min(1, y));
+
+        return { x, y };
+    }
+
+    function sendInputEvent(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            log("Cannot send INPUT_EVENT: WS is not open");
+            return;
+        }
+
+        if (!currentSessionId) {
+            log("Cannot send INPUT_EVENT: session is not started");
+            return;
+        }
+
+        const machineId = getMachineId();
+        const viewerId = getViewerId();
 
         ws.send(JSON.stringify({
-            type: "REGISTER_VIEWER",
-            viewerId
+            type: "INPUT_EVENT",
+            sessionId: currentSessionId,
+            machineId,
+            viewerId,
+            payload: JSON.stringify(payload)
         }));
-    };
+    }
 
-    ws.onerror = (e) => {
-        log("WS error", e);
-    };
-
-    ws.onclose = (e) => {
-        log("WS close", e.code, e.reason);
-    };
-
-    ws.onmessage = async (event) => {
-        const msg = JSON.parse(event.data);
-        log("WS message:", msg);
-
-        try {
-            if (msg.type === "START_SESSION_ACK") {
-                currentSessionId = msg.sessionId;
-                log("Session ACK:", currentSessionId);
-            }
-
-            if (msg.type === "SDP_ANSWER") {
-                log("Received SDP_ANSWER");
-                await pc.setRemoteDescription({
-                    type: "answer",
-                    sdp: msg.sdp
-                });
-                log("Remote description set");
-            }
-
-            if (msg.type === "ICE_CANDIDATE") {
-                log("Received ICE_CANDIDATE");
-                await pc.addIceCandidate({
-                    candidate: msg.candidate,
-                    sdpMid: msg.sdpMid,
-                    sdpMLineIndex: msg.sdpMLineIndex
-                });
-            }
-        } catch (err) {
-            log("WS message handling error:", err.message);
-            console.error(err);
+    function attachRemoteControls() {
+        if (controlsAttached) {
+            return;
         }
-    };
+        controlsAttached = true;
+
+        remoteVideo.style.cursor = "none";
+        remoteVideo.style.outline = "none";
+
+        let lastMoveSentAt = 0;
+
+        remoteVideo.addEventListener("mousemove", (e) => {
+            const now = Date.now();
+            if (now - lastMoveSentAt < 12) {
+                return;
+            }
+            lastMoveSentAt = now;
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_move",
+                x,
+                y
+            });
+        });
+
+        remoteVideo.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            remoteVideo.focus();
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_down",
+                x,
+                y,
+                button: mapMouseButton(e.button)
+            });
+        });
+
+        remoteVideo.addEventListener("mouseup", (e) => {
+            e.preventDefault();
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_up",
+                x,
+                y,
+                button: mapMouseButton(e.button)
+            });
+        });
+
+        remoteVideo.addEventListener("click", (e) => {
+            e.preventDefault();
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_click",
+                x,
+                y,
+                button: mapMouseButton(e.button)
+            });
+        });
+
+        remoteVideo.addEventListener("dblclick", (e) => {
+            e.preventDefault();
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_double_click",
+                x,
+                y,
+                button: mapMouseButton(e.button)
+            });
+        });
+
+        remoteVideo.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+
+            const { x, y } = getNormalizedCoordinates(remoteVideo, e);
+
+            sendInputEvent({
+                eventType: "mouse_click",
+                x,
+                y,
+                button: 3
+            });
+        });
+
+        remoteVideo.addEventListener("wheel", (e) => {
+            e.preventDefault();
+
+            sendInputEvent({
+                eventType: "mouse_wheel",
+                wheelDelta: e.deltaY > 0 ? 1 : -1
+            });
+        }, { passive: false });
+
+        window.addEventListener("keydown", (e) => {
+            if (document.activeElement !== remoteVideo) return;
+
+            e.preventDefault();
+
+            sendInputEvent({
+                eventType: "key_down",
+                key: e.key,
+                code: e.code
+            });
+        });
+
+        window.addEventListener("keyup", (e) => {
+            if (document.activeElement !== remoteVideo) return;
+
+            e.preventDefault();
+
+            sendInputEvent({
+                eventType: "key_up",
+                key: e.key,
+                code: e.code
+            });
+        });
+
+        log("Remote controls attached");
+    }
 
     async function createPeer() {
+        if (pc) {
+            return;
+        }
+
         log("Creating RTCPeerConnection");
 
         pc = new RTCPeerConnection({
@@ -90,8 +357,8 @@
         });
 
         pc.ontrack = (event) => {
-            log("ontrack fired", event.streams.length);
-            document.getElementById("remoteVideo").srcObject = event.streams[0];
+            log("ontrack fired");
+            remoteVideo.srcObject = event.streams[0];
         };
 
         pc.onconnectionstatechange = () => {
@@ -112,80 +379,62 @@
                 return;
             }
 
-            log("Sending ICE candidate");
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log("Cannot send ICE: WS is not open");
+                return;
+            }
+
             ws.send(JSON.stringify({
                 type: "ICE_CANDIDATE",
                 sessionId: currentSessionId,
-                machineId: document.getElementById("machineId").value,
-                viewerId: document.getElementById("viewerId").value,
+                machineId: getMachineId(),
+                viewerId: getViewerId(),
                 candidate: event.candidate.candidate,
                 sdpMid: event.candidate.sdpMid,
                 sdpMLineIndex: event.candidate.sdpMLineIndex
             }));
+
+            log("ICE candidate sent");
         };
 
-        dc = pc.createDataChannel("control");
+        dataChannel = pc.createDataChannel("control");
 
-        dc.onopen = () => log("DataChannel open");
-        dc.onclose = () => log("DataChannel close");
-        dc.onerror = (e) => log("DataChannel error", e);
+        dataChannel.onopen = () => {
+            log("DataChannel open");
+        };
 
-        const video = document.getElementById("remoteVideo");
+        dataChannel.onclose = () => {
+            log("DataChannel close");
+        };
 
-        video.addEventListener("mousemove", (e) => {
-            if (!dc || dc.readyState !== "open") return;
-
-            const rect = video.getBoundingClientRect();
-            const x = (e.clientX - rect.left) / rect.width;
-            const y = (e.clientY - rect.top) / rect.height;
-
-            dc.send(JSON.stringify({
-                eventType: "mouse_move",
-                x,
-                y
-            }));
-        });
-
-        video.addEventListener("click", () => {
-            if (!dc || dc.readyState !== "open") return;
-
-            dc.send(JSON.stringify({
-                eventType: "mouse_click",
-                button: 1
-            }));
-        });
-
-        window.addEventListener("keydown", (e) => {
-            if (!dc || dc.readyState !== "open") return;
-
-            dc.send(JSON.stringify({
-                eventType: "key_down",
-                key: e.key,
-                code: e.code
-            }));
-        });
-
-        window.addEventListener("keyup", (e) => {
-            if (!dc || dc.readyState !== "open") return;
-
-            dc.send(JSON.stringify({
-                eventType: "key_up",
-                key: e.key,
-                code: e.code
-            }));
-        });
+        dataChannel.onerror = (e) => {
+            log("DataChannel error", e);
+        };
     }
 
-    document.getElementById("startBtn").onclick = async () => {
-        const viewerId = document.getElementById("viewerId").value;
-        const machineId = document.getElementById("machineId").value;
+    async function startSession() {
+        if (!signalingConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+            log("Сначала подключи signaling");
+            return;
+        }
+
+        const machineId = getMachineId();
+        const viewerId = getViewerId();
+
+        if (!machineId || !viewerId) {
+            log("machineId и viewerId обязательны");
+            return;
+        }
 
         log("Starting session for", machineId, viewerId);
 
         const res = await fetch("/api/remote-sessions/start", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ machineId, viewerId })
+            body: JSON.stringify({
+                machineId,
+                viewerId
+            })
         });
 
         if (!res.ok) {
@@ -196,6 +445,7 @@
 
         const session = await res.json();
         currentSessionId = session.sessionId;
+
         log("Session created:", session);
 
         await createPeer();
@@ -205,20 +455,70 @@
             offerToReceiveAudio: false
         });
 
-        log("Offer created");
         await pc.setLocalDescription(offer);
-        log("Local description set");
 
         ws.send(JSON.stringify({
             type: "SDP_OFFER",
-            sessionId: session.sessionId,
+            sessionId: currentSessionId,
             machineId,
             viewerId,
             sdp: offer.sdp
         }));
 
         log("SDP_OFFER sent");
-    };
+    }
+
+    function stopSession() {
+        log("Stopping session");
+
+        currentSessionId = null;
+
+        if (dataChannel) {
+            try {
+                dataChannel.close();
+            } catch (e) {
+                console.error(e);
+            }
+            dataChannel = null;
+        }
+
+        if (pc) {
+            try {
+                pc.close();
+            } catch (e) {
+                console.error(e);
+            }
+            pc = null;
+        }
+
+        remoteVideo.srcObject = null;
+
+        log("Session stopped");
+    }
+
+    document.getElementById("connectBtn").onclick = connectSignaling;
+    document.getElementById("startBtn").onclick = startSession;
+    document.getElementById("stopBtn").onclick = stopSession;
+
+    attachRemoteControls();
+
+    window.addEventListener("beforeunload", () => {
+        try {
+            if (dataChannel) {
+                dataChannel.close();
+            }
+
+            if (pc) {
+                pc.close();
+            }
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    });
 </script>
 </body>
 </html>

@@ -98,6 +98,31 @@ public class SessionRoutingService {
                     agent.sendMessage(new TextMessage(objectMapper.writeValueAsString(envelope)));
                 }
             }
+
+            case UNREGISTER_AGENT -> {
+                machineService.markOffline(envelope.getMachineId());
+                System.out.println("Agent unregistered: " + envelope.getMachineId());
+            }
+
+            case REQUEST_CONSENT -> {
+                System.out.println("Routing REQUEST_CONSENT to agent: " + envelope.getMachineId());
+                WebSocketSession agent = connectionRegistry.getAgent(envelope.getMachineId());
+                if (agent != null && agent.isOpen()) {
+                    agent.sendMessage(new TextMessage(objectMapper.writeValueAsString(envelope)));
+                } else {
+                    System.out.println("Agent session not found for machineId: " + envelope.getMachineId());
+                }
+            }
+
+            case CONSENT_GRANTED, CONSENT_DECLINED -> {
+                System.out.println("Routing consent response to viewer: " + envelope.getViewerId());
+                WebSocketSession viewer = connectionRegistry.getViewer(envelope.getViewerId());
+                if (viewer != null && viewer.isOpen()) {
+                    viewer.sendMessage(new TextMessage(objectMapper.writeValueAsString(envelope)));
+                } else {
+                    System.out.println("Viewer session not found for viewerId: " + envelope.getViewerId());
+                }
+            }
         }
     }
 }

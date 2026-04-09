@@ -66,6 +66,24 @@ public class MachineService {
         });
     }
 
+    @Transactional
+    public void deactivate(String machineId) {
+        Machine machine = machineRepository.findById(machineId)
+                .orElseThrow(() -> new IllegalArgumentException("Machine not found: " + machineId));
+
+        machine.setStatus(MachineStatus.OFFLINE);
+        machineRepository.save(machine);
+    }
+
+    @Transactional
+    public void delete(String machineId) {
+        if (!machineRepository.existsById(machineId)) {
+            throw new IllegalArgumentException("Machine not found: " + machineId);
+        }
+
+        machineRepository.deleteById(machineId);
+    }
+
     private MachineDto toDto(Machine machine) {
         return MachineDto.builder()
                 .machineId(machine.getMachineId())
