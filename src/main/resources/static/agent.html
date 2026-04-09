@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Agent</title>
+</head>
+<body>
+<h1>Agent</h1>
+<label>Machine ID: <input id="machineId" value="machine-1"></label>
+<button id="registerBtn">Register & Share screen</button>
+
+<pre id="log" style="background:#111;color:#0f0;padding:12px;height:300px;overflow:auto;"></pre>
+
+<script>
+    const logEl = document.getElementById("log");
+
+    function log(...args) {
+        console.log(...args);
+        logEl.textContent += args.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ") + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const ws = new WebSocket("ws://localhost:8080/ws/signaling");
+    let pc = null;
+    let dataChannel = null;
+    let localStream = null;
+
+    ws.onopen = () => {
+        log("WS opened");
+    };
+
+    ws.onerror = (e) => {
+        log("WS error", e);
+    };
+
+    ws.onclose = (e) => {
+        log("WS close", e.code, e.reason);
+    };
+
+    ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        log("WS message:", msg);
+
+        try {
+            if (msg.type === "SDP_OFFER") {
+                log("Received SDP_OFFER");
+
+                await ensurePeer(msg.viewerId, msg.sessionId, msg.machineId);
+
+                await pc.setRemoteDescription({
+                    type: "offer",
+                    sdp: msg.sdp
+                });
+                log("Remote description set");
+
+                const answer = await pc.createAnswer();
+                log("Answer created");
+
+                await pc.setLocalDescription(answer);
+                log("Local description set");
+
+                ws.send(JSON.stringify({
+                    type: "SDP_ANSWER",
+                    sessionId: msg.sessionId,
+                    machineId: msg.machineId,
+                    viewerId: msg.viewerId,
+                    sdp: answer.sdp
+                }));
+                log("SDP_ANSWER sent");
+
+                ws.send(JSON.stringify({
+                    type: "START_SESSION_ACK",
+                    sessionId: msg.sessionId,
+                    machineId: msg.machineId,
+                    viewerId: msg.viewerId
+                }));
+                log("START_SESSION_ACK sent");
+            }
+
+            if (msg.type === "ICE_CANDIDATE") {
+                log("Received ICE_CANDIDATE");
+                if (pc) {
+                    await pc.addIceCandidate({
+                        candidate: msg.candidate,
+                        sdpMid: msg.sdpMid,
+                        sdpMLineIndex: msg.sdpMLineIndex
+                    });
+                }
+            }
+        } catch (err) {
+            log("WS message handling error:", err.message);
+            console.error(err);
+        }
+    };
+
+    async function ensurePeer(viewerId, sessionId, machineId) {
+        if (pc) return;
+
+        log("Requesting display media");
+        localStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false
+        });
+        log("Display media granted");
+
+        pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" }
+            ]
+        });
+
+        pc.onconnectionstatechange = () => {
+            log("pc.connectionState =", pc.connectionState);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            log("pc.iceConnectionState =", pc.iceConnectionState);
+        };
+
+        pc.onicegatheringstatechange = () => {
+            log("pc.iceGatheringState =", pc.iceGatheringState);
+        };
+
+        localStream.getTracks().forEach(track => {
+            log("Adding track:", track.kind);
+            pc.addTrack(track, localStream);
+        });
+
+        pc.onicecandidate = (event) => {
+            if (!event.candidate) {
+                log("ICE gathering complete");
+                return;
+            }
+
+            log("Sending ICE candidate");
+
+            ws.send(JSON.stringify({
+                type: "ICE_CANDIDATE",
+                sessionId,
+                machineId,
+                viewerId,
+                candidate: event.candidate.candidate,
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex
+            }));
+        };
+
+        pc.ondatachannel = (event) => {
+            log("DataChannel received");
+            dataChannel = event.channel;
+
+            dataChannel.onopen = () => log("DataChannel open");
+            dataChannel.onclose = () => log("DataChannel close");
+            dataChannel.onerror = (e) => log("DataChannel error", e);
+
+            dataChannel.onmessage = (ev) => {
+                log("control event:", ev.data);
+            };
+        };
+    }
+
+    document.getElementById("registerBtn").onclick = async () => {
+        const machineId = document.getElementById("machineId").value;
+
+        log("Registering machine:", machineId);
+
+        const res = await fetch("/api/machines/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                machineId,
+                hostname: "demo-browser-agent",
+                osName: navigator.platform,
+                agentVersion: "0.1-demo",
+                ip: "browser"
+            })
+        });
+
+        log("Register response:", res.status);
+
+        ws.send(JSON.stringify({
+            type: "REGISTER_AGENT",
+            machineId
+        }));
+
+        log("REGISTER_AGENT sent");
+
+        setInterval(() => {
+            ws.send(JSON.stringify({
+                type: "HEARTBEAT",
+                machineId
+            }));
+            log("HEARTBEAT sent");
+        }, 5000);
+    };
+</script>
+</body>
+</html>

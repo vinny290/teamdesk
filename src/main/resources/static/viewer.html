@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Viewer</title>
+</head>
+<body>
+<h1>Viewer</h1>
+
+<label>Viewer ID: <input id="viewerId" value="viewer-1"></label><br>
+<label>Machine ID: <input id="machineId" value="machine-1"></label><br>
+<button id="startBtn">Start session</button>
+
+<video id="remoteVideo" autoplay playsinline controls style="width: 900px; border: 1px solid #999;"></video>
+
+<pre id="log" style="background:#111;color:#0f0;padding:12px;height:300px;overflow:auto;"></pre>
+
+<script>
+    const logEl = document.getElementById("log");
+
+    function log(...args) {
+        console.log(...args);
+        logEl.textContent += args.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ") + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const ws = new WebSocket("ws://localhost:8080/ws/signaling");
+    let pc = null;
+    let dc = null;
+    let currentSessionId = null;
+
+    ws.onopen = () => {
+        const viewerId = document.getElementById("viewerId").value;
+        log("WS opened, register viewer:", viewerId);
+
+        ws.send(JSON.stringify({
+            type: "REGISTER_VIEWER",
+            viewerId
+        }));
+    };
+
+    ws.onerror = (e) => {
+        log("WS error", e);
+    };
+
+    ws.onclose = (e) => {
+        log("WS close", e.code, e.reason);
+    };
+
+    ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        log("WS message:", msg);
+
+        try {
+            if (msg.type === "START_SESSION_ACK") {
+                currentSessionId = msg.sessionId;
+                log("Session ACK:", currentSessionId);
+            }
+
+            if (msg.type === "SDP_ANSWER") {
+                log("Received SDP_ANSWER");
+                await pc.setRemoteDescription({
+                    type: "answer",
+                    sdp: msg.sdp
+                });
+                log("Remote description set");
+            }
+
+            if (msg.type === "ICE_CANDIDATE") {
+                log("Received ICE_CANDIDATE");
+                await pc.addIceCandidate({
+                    candidate: msg.candidate,
+                    sdpMid: msg.sdpMid,
+                    sdpMLineIndex: msg.sdpMLineIndex
+                });
+            }
+        } catch (err) {
+            log("WS message handling error:", err.message);
+            console.error(err);
+        }
+    };
+
+    async function createPeer() {
+        log("Creating RTCPeerConnection");
+
+        pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" }
+            ]
+        });
+
+        pc.ontrack = (event) => {
+            log("ontrack fired", event.streams.length);
+            document.getElementById("remoteVideo").srcObject = event.streams[0];
+        };
+
+        pc.onconnectionstatechange = () => {
+            log("pc.connectionState =", pc.connectionState);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            log("pc.iceConnectionState =", pc.iceConnectionState);
+        };
+
+        pc.onicegatheringstatechange = () => {
+            log("pc.iceGatheringState =", pc.iceGatheringState);
+        };
+
+        pc.onicecandidate = (event) => {
+            if (!event.candidate) {
+                log("ICE gathering complete");
+                return;
+            }
+
+            log("Sending ICE candidate");
+            ws.send(JSON.stringify({
+                type: "ICE_CANDIDATE",
+                sessionId: currentSessionId,
+                machineId: document.getElementById("machineId").value,
+                viewerId: document.getElementById("viewerId").value,
+                candidate: event.candidate.candidate,
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex
+            }));
+        };
+
+        dc = pc.createDataChannel("control");
+
+        dc.onopen = () => log("DataChannel open");
+        dc.onclose = () => log("DataChannel close");
+        dc.onerror = (e) => log("DataChannel error", e);
+
+        const video = document.getElementById("remoteVideo");
+
+        video.addEventListener("mousemove", (e) => {
+            if (!dc || dc.readyState !== "open") return;
+
+            const rect = video.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / rect.width;
+            const y = (e.clientY - rect.top) / rect.height;
+
+            dc.send(JSON.stringify({
+                eventType: "mouse_move",
+                x,
+                y
+            }));
+        });
+
+        video.addEventListener("click", () => {
+            if (!dc || dc.readyState !== "open") return;
+
+            dc.send(JSON.stringify({
+                eventType: "mouse_click",
+                button: 1
+            }));
+        });
+
+        window.addEventListener("keydown", (e) => {
+            if (!dc || dc.readyState !== "open") return;
+
+            dc.send(JSON.stringify({
+                eventType: "key_down",
+                key: e.key,
+                code: e.code
+            }));
+        });
+
+        window.addEventListener("keyup", (e) => {
+            if (!dc || dc.readyState !== "open") return;
+
+            dc.send(JSON.stringify({
+                eventType: "key_up",
+                key: e.key,
+                code: e.code
+            }));
+        });
+    }
+
+    document.getElementById("startBtn").onclick = async () => {
+        const viewerId = document.getElementById("viewerId").value;
+        const machineId = document.getElementById("machineId").value;
+
+        log("Starting session for", machineId, viewerId);
+
+        const res = await fetch("/api/remote-sessions/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ machineId, viewerId })
+        });
+
+        if (!res.ok) {
+            log("Start session failed:", res.status);
+            log(await res.text());
+            return;
+        }
+
+        const session = await res.json();
+        currentSessionId = session.sessionId;
+        log("Session created:", session);
+
+        await createPeer();
+
+        const offer = await pc.createOffer({
+            offerToReceiveVideo: true,
+            offerToReceiveAudio: false
+        });
+
+        log("Offer created");
+        await pc.setLocalDescription(offer);
+        log("Local description set");
+
+        ws.send(JSON.stringify({
+            type: "SDP_OFFER",
+            sessionId: session.sessionId,
+            machineId,
+            viewerId,
+            sdp: offer.sdp
+        }));
+
+        log("SDP_OFFER sent");
+    };
+</script>
+</body>
+</html>
