@@ -19,6 +19,8 @@
             --neutral-bg: #eef2f7;
             --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
             --radius: 16px;
+            --warning-bg: #fef3c7;
+            --warning-text: #92400e;
         }
 
         * {
@@ -111,12 +113,17 @@
             transition: 0.15s ease;
         }
 
+        button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
         .btn-primary {
             background: var(--primary);
             color: #fff;
         }
 
-        .btn-primary:hover {
+        .btn-primary:hover:not(:disabled) {
             background: var(--primary-hover);
         }
 
@@ -125,7 +132,7 @@
             color: var(--text);
         }
 
-        .btn-secondary:hover {
+        .btn-secondary:hover:not(:disabled) {
             background: #dfe7f2;
         }
 
@@ -134,7 +141,7 @@
             color: #fff;
         }
 
-        .btn-danger:hover {
+        .btn-danger:hover:not(:disabled) {
             background: var(--danger-hover);
         }
 
@@ -169,6 +176,51 @@
 
         .panel-body {
             padding: 16px;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: bold;
+            background: #eef2f7;
+            color: #334155;
+        }
+
+        .status-pill.connected {
+            background: var(--success-bg);
+            color: var(--success-text);
+        }
+
+        .status-pill.connecting {
+            background: var(--warning-bg);
+            color: var(--warning-text);
+        }
+
+        .status-pill.disconnected {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: currentColor;
+            display: inline-block;
+        }
+
+        .status-dot.pulsing {
+            animation: pulse 1.2s infinite ease-in-out;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.9); opacity: 0.55; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.55; }
         }
 
         .machines-list {
@@ -318,7 +370,7 @@
             padding: 0;
         }
 
-        .icon-btn:hover {
+        .icon-btn:hover:not(:disabled) {
             background: #dbe5f2;
         }
 
@@ -327,7 +379,7 @@
             color: #b91c1c;
         }
 
-        .icon-btn.danger:hover {
+        .icon-btn.danger:hover:not(:disabled) {
             background: #fecaca;
         }
 
@@ -393,6 +445,10 @@
                 Просматривай доступные агенты, добавляй по ID и открывай несколько удалённых экранов
             </div>
         </div>
+        <div id="signalingStatus" class="status-pill disconnected">
+            <span id="signalingDot" class="status-dot"></span>
+            <span id="signalingText">Signaling отключён</span>
+        </div>
     </div>
 
     <div class="topbar">
@@ -403,7 +459,7 @@
 
         <div class="field">
             <label for="machineIdInput">Добавить агента по ID</label>
-            <input id="machineIdInput" placeholder="Например: desktop-agent-1">
+            <input id="machineIdInput" placeholder="Например: 4 123 456 789 или 4123456789">
         </div>
 
         <div class="actions">
@@ -443,8 +499,15 @@
     const sessionsGridEl = document.getElementById("sessionsGrid");
     const pageMessageEl = document.getElementById("pageMessage");
 
+    const signalingStatusEl = document.getElementById("signalingStatus");
+    const signalingDotEl = document.getElementById("signalingDot");
+    const signalingTextEl = document.getElementById("signalingText");
+
     let ws = null;
     let signalingConnected = false;
+    let reconnectTimeout = null;
+    let reconnectAttempt = 0;
+    let shouldAutoReconnect = true;
     let activeSessionKey = null;
 
     const sessions = new Map();
@@ -461,6 +524,36 @@
 
     function getMachineIdInput() {
         return document.getElementById("machineIdInput").value.trim();
+    }
+
+    function normalizeMachineId(value) {
+        return String(value || "").replaceAll(/\s+/g, "");
+    }
+
+    function formatMachineId(value) {
+        const raw = normalizeMachineId(value);
+        if (!/^\d{10}$/.test(raw)) {
+            return value || "—";
+        }
+
+        return `${raw.slice(0, 1)} ${raw.slice(1, 4)} ${raw.slice(4, 7)} ${raw.slice(7, 10)}`;
+    }
+
+    function setSignalingStatus(state, text) {
+        signalingStatusEl.classList.remove("connected", "connecting", "disconnected");
+        signalingDotEl.classList.remove("pulsing");
+
+        if (state === "connected") {
+            signalingStatusEl.classList.add("connected");
+        } else if (state === "connecting") {
+            signalingStatusEl.classList.add("connecting");
+            signalingDotEl.classList.add("pulsing");
+        } else {
+            signalingStatusEl.classList.add("disconnected");
+        }
+
+        signalingTextEl.textContent = text;
+        updateUiAvailability();
     }
 
     function formatDate(value) {
@@ -516,7 +609,23 @@
         }
     }
 
-    function connectSignaling() {
+    function scheduleReconnect() {
+        if (!shouldAutoReconnect || reconnectTimeout) {
+            return;
+        }
+
+        reconnectAttempt += 1;
+        const delay = Math.min(2000 * reconnectAttempt, 8000);
+
+        setSignalingStatus("connecting", `Переподключение к signaling через ${Math.round(delay / 1000)} сек...`);
+
+        reconnectTimeout = setTimeout(() => {
+            reconnectTimeout = null;
+            connectSignaling(true);
+        }, delay);
+    }
+
+    function connectSignaling(isReconnect = false) {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
             return;
         }
@@ -527,10 +636,17 @@
             return;
         }
 
+        setSignalingStatus("connecting", isReconnect ? "Переподключение к signaling..." : "Подключение к signaling...");
+
         ws = new WebSocket("ws://localhost:8080/ws/signaling");
 
         ws.onopen = () => {
             signalingConnected = true;
+            reconnectAttempt = 0;
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
 
             ws.send(JSON.stringify({
                 type: "REGISTER_VIEWER",
@@ -541,7 +657,8 @@
             btn.textContent = "Signaling подключён";
             btn.disabled = true;
 
-            setPageMessage("Signaling подключён");
+            setSignalingStatus("connected", "🟢 Signaling подключён");
+            setPageMessage("Соединение с signaling установлено");
         };
 
         ws.onmessage = async (event) => {
@@ -555,15 +672,21 @@
 
         ws.onclose = () => {
             signalingConnected = false;
+            ws = null;
+
             const btn = document.getElementById("connectSignalingBtn");
             btn.textContent = "Подключить signaling";
             btn.disabled = false;
-            setPageMessage("Signaling отключён", true);
+
+            setSignalingStatus("disconnected", "🔴 Signaling отключён");
+            setPageMessage("Соединение с signaling потеряно", true);
+
+            scheduleReconnect();
         };
     }
 
     async function routeWsMessage(msg) {
-        const machineId = msg.machineId;
+        const machineId = msg.machineId ? normalizeMachineId(msg.machineId) : null;
         const session = machineId ? sessions.get(machineId) : null;
 
         if (msg.type === "CONSENT_GRANTED") {
@@ -623,12 +746,35 @@
                 throw new Error("Не удалось загрузить список машин");
             }
 
-            machinesCache = await res.json();
+            const loaded = await res.json();
+            machinesCache = loaded.map(m => ({
+                ...m,
+                machineId: normalizeMachineId(m.machineId)
+            }));
+
             renderMachines(machinesCache);
             setPageMessage(`Загружено агентов: ${machinesCache.length}`);
         } catch (e) {
             setPageMessage("Ошибка загрузки списка агентов", true);
             console.error(e);
+        }
+    }
+
+    function updateUiAvailability() {
+        const offline = !signalingConnected;
+
+        document.getElementById("refreshMachinesBtn").disabled = offline;
+        document.getElementById("addMachineBtn").disabled = offline;
+
+        renderMachines(machinesCache);
+
+        for (const session of sessions.values()) {
+            if (session.connectBtnEl) {
+                session.connectBtnEl.disabled = offline || session.consentPending || session.startInProgress || !!session.sessionId;
+            }
+            if (session.stopBtnEl) {
+                session.stopBtnEl.disabled = offline && !session.sessionId;
+            }
         }
     }
 
@@ -652,12 +798,13 @@
             div.className = `machine-card ${machine.status === "ONLINE" ? "online" : "offline"}`;
 
             const alreadyOpen = sessions.has(machine.machineId);
+            const connectDisabled = !signalingConnected || machine.status !== "ONLINE" || alreadyOpen;
 
             div.innerHTML = `
                 <div class="machine-top">
                     <div>
-                        <div class="machine-name">${escapeHtml(machine.hostname || machine.machineId)}</div>
-                        <div class="machine-id">ID: ${escapeHtml(machine.machineId)}</div>
+                        <div class="machine-name">${escapeHtml(machine.hostname || formatMachineId(machine.machineId))}</div>
+                        <div class="machine-id">ID: ${escapeHtml(formatMachineId(machine.machineId))}</div>
                     </div>
                     <span class="badge ${machine.status === "ONLINE" ? "online" : "offline"}">
                         ${escapeHtml(machine.status)}
@@ -670,17 +817,17 @@
                 <div class="machine-meta">Последний heartbeat: ${escapeHtml(formatDate(machine.lastHeartbeatAt))}</div>
 
                 <div class="machine-actions">
-                    <button class="btn-primary connect-btn" ${machine.status !== "ONLINE" || alreadyOpen ? "disabled" : ""}>
+                    <button class="btn-primary connect-btn" ${connectDisabled ? "disabled" : ""}>
                         ${alreadyOpen ? "Открыто" : "Подключиться"}
                     </button>
-                    <button class="btn-danger delete-btn">Удалить</button>
+                    <button class="btn-danger delete-btn" ${!signalingConnected ? "disabled" : ""}>Удалить</button>
                 </div>
             `;
 
             const connectBtn = div.querySelector(".connect-btn");
             const deleteBtn = div.querySelector(".delete-btn");
 
-            if (machine.status === "ONLINE" && !alreadyOpen) {
+            if (!connectDisabled) {
                 connectBtn.onclick = () => openMachineSession(machine);
             }
 
@@ -691,7 +838,9 @@
     }
 
     async function addMachineById() {
-        const machineId = getMachineIdInput();
+        const machineIdInput = getMachineIdInput();
+        const machineId = normalizeMachineId(machineIdInput);
+
         if (!machineId) {
             setPageMessage("Введи ID агента", true);
             return;
@@ -699,7 +848,7 @@
 
         const existing = machinesCache.find(x => x.machineId === machineId);
         if (existing) {
-            setPageMessage(`Агент ${machineId} уже есть в списке`);
+            setPageMessage(`Агент ${formatMachineId(machineId)} уже есть в списке`);
             return;
         }
 
@@ -709,18 +858,22 @@
                 throw new Error("Не удалось загрузить список машин");
             }
 
-            const allMachines = await res.json();
+            const allMachines = (await res.json()).map(m => ({
+                ...m,
+                machineId: normalizeMachineId(m.machineId)
+            }));
+
             const found = allMachines.find(x => x.machineId === machineId);
 
             if (!found) {
-                setPageMessage(`Агент с ID ${machineId} не найден`, true);
+                setPageMessage(`Агент с ID ${formatMachineId(machineId)} не найден`, true);
                 return;
             }
 
             machinesCache.push(found);
             renderMachines(machinesCache);
             document.getElementById("machineIdInput").value = "";
-            setPageMessage(`Агент ${machineId} добавлен в список`);
+            setPageMessage(`Агент ${formatMachineId(machineId)} добавлен в список`);
         } catch (e) {
             setPageMessage("Ошибка при добавлении агента", true);
             console.error(e);
@@ -728,7 +881,7 @@
     }
 
     async function deleteMachine(machine) {
-        const confirmed = confirm(`Удалить агента "${machine.hostname || machine.machineId}"?`);
+        const confirmed = confirm(`Удалить агента "${machine.hostname || formatMachineId(machine.machineId)}"?`);
         if (!confirmed) return;
 
         try {
@@ -747,7 +900,7 @@
 
             machinesCache = machinesCache.filter(x => x.machineId !== machine.machineId);
             renderMachines(machinesCache);
-            setPageMessage(`Агент ${machine.machineId} удалён`);
+            setPageMessage(`Агент ${formatMachineId(machine.machineId)} удалён`);
         } catch (e) {
             setPageMessage("Не удалось удалить агента", true);
             console.error(e);
@@ -765,11 +918,12 @@
         renderSessionCard(session);
         renderMachines(machinesCache);
         setSessionStatus(session, "Готово к подключению");
+        updateUiAvailability();
     }
 
     function createSessionState(machine) {
         return {
-            machineId: machine.machineId,
+            machineId: normalizeMachineId(machine.machineId),
             hostname: machine.hostname || machine.machineId,
             osName: machine.osName || "",
             viewerId: getViewerId(),
@@ -782,6 +936,8 @@
             cardEl: null,
             videoEl: null,
             statusEl: null,
+            connectBtnEl: null,
+            stopBtnEl: null,
             statusText: "Idle",
             expanded: false
         };
@@ -802,7 +958,7 @@
             <div class="session-header">
                 <div>
                     <div class="session-title">${escapeHtml(session.hostname)}</div>
-                    <div class="session-subtitle">ID: ${escapeHtml(session.machineId)}</div>
+                    <div class="session-subtitle">ID: ${escapeHtml(formatMachineId(session.machineId))}</div>
                     <div class="session-subtitle">OS: ${escapeHtml(session.osName || "—")}</div>
                     <div id="${statusId}" class="session-status">${escapeHtml(session.statusText)}</div>
                 </div>
@@ -831,14 +987,14 @@
         session.cardEl = card;
         session.videoEl = card.querySelector(`#${cssEscapeId(videoId)}`);
         session.statusEl = card.querySelector(`#${cssEscapeId(statusId)}`);
+        session.connectBtnEl = card.querySelector(`#${cssEscapeId(connectBtnId)}`);
+        session.stopBtnEl = card.querySelector(`#${cssEscapeId(stopBtnId)}`);
 
-        const connectBtn = card.querySelector(`#${cssEscapeId(connectBtnId)}`);
-        const stopBtn = card.querySelector(`#${cssEscapeId(stopBtnId)}`);
         const expandBtn = card.querySelector(`#${cssEscapeId(expandBtnId)}`);
         const closeBtn = card.querySelector(`#${cssEscapeId(closeBtnId)}`);
 
-        connectBtn.onclick = () => requestConsent(session);
-        stopBtn.onclick = () => stopMachineSession(session.machineId);
+        session.connectBtnEl.onclick = () => requestConsent(session);
+        session.stopBtnEl.onclick = () => stopMachineSession(session.machineId);
         expandBtn.onclick = () => toggleExpandSession(session.machineId);
         closeBtn.onclick = () => closeSessionCard(session.machineId);
 
@@ -851,6 +1007,8 @@
         session.videoEl.addEventListener("click", () => {
             setActiveSession(session.machineId);
         });
+
+        updateUiAvailability();
     }
 
     function toggleExpandSession(machineId) {
@@ -900,6 +1058,7 @@
         session.consentPending = true;
         session.consentGranted = false;
         setSessionStatus(session, "Ожидание подтверждения");
+        updateUiAvailability();
 
         ws.send(JSON.stringify({
             type: "REQUEST_CONSENT",
@@ -915,6 +1074,7 @@
 
         session.startInProgress = true;
         setSessionStatus(session, "Создание сессии");
+        updateUiAvailability();
 
         try {
             const res = await fetch("/api/remote-sessions/start", {
@@ -958,6 +1118,7 @@
             setPageMessage(`Не удалось запустить сессию для ${session.hostname}`, true);
         } finally {
             session.startInProgress = false;
+            updateUiAvailability();
         }
     }
 
@@ -979,6 +1140,7 @@
 
         session.pc.onconnectionstatechange = () => {
             if (!session.pc) return;
+
             if (session.pc.connectionState === "connected") {
                 setSessionStatus(session, "Подключено");
             } else if (session.pc.connectionState === "disconnected") {
@@ -1212,14 +1374,26 @@
             sessions.delete(session.machineId);
             renderMachines(machinesCache);
         }
+
+        updateUiAvailability();
     }
 
-    document.getElementById("connectSignalingBtn").onclick = connectSignaling;
+    document.getElementById("connectSignalingBtn").onclick = () => {
+        shouldAutoReconnect = true;
+        connectSignaling(false);
+    };
     document.getElementById("refreshMachinesBtn").onclick = loadMachines;
     document.getElementById("addMachineBtn").onclick = addMachineById;
 
     window.addEventListener("beforeunload", () => {
         try {
+            shouldAutoReconnect = false;
+
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+
             if (ws && ws.readyState === WebSocket.OPEN) {
                 for (const session of sessions.values()) {
                     if (session.sessionId) {
@@ -1251,7 +1425,11 @@
         }
     });
 
-    loadMachines();
+    window.addEventListener("load", () => {
+        setSignalingStatus("connecting", "Подключение к signaling...");
+        connectSignaling(false);
+        loadMachines();
+    });
 </script>
 </body>
 </html>
